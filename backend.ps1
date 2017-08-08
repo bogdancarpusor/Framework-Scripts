@@ -200,8 +200,55 @@ class AzureBackend : Backend {
 
 class HypervBackend : Backend {
     [String] $Name="HypervBackend"
+    [String] $ServerName="localhost"
+
 
     HypervBackend ($Params) : base ($Params) {}
+
+    [boolean] CreateVM ($vmName, $vhdPath, $memSize, $generation, $switchName) {
+        New-VM -Name $vmName -ComputerName $this.ServerName -VHDPath $vhdPath -MemoryStartupBytes $memSize -SwitchName $switchName -Generation $generation
+        if (-not $?) {
+           Write-Host "Unable to create VM ${vmName} on server ${this.ServerName}" -ForegroundColor Red
+           return $false
+        }
+        return $true
+    }
+
+    [boolean] GetVM ($vmName) {
+        Get-VM -Name $vmName -ComputerName $this.ServerName
+        if (-not $?) {
+           Write-Host "Unable to get VM ${vmName} on server ${this.ServerName}" -ForegroundColor Red
+           return $false
+        }
+        return $true
+    }
+
+    [boolean] StopVM ($vmName) {
+        Stop-VM -Name $vmName -ComputerName $this.ServerName -force
+        if (-not $?) {
+           Write-Host "Unable to get VM ${vmName} on server ${this.ServerName}" -ForegroundColor Red
+           return $false
+        }
+        return $true
+    }
+
+    [boolean] RemoveVM ($vmName) {
+        Remove-VM -Name $vmName -ComputerName $this.ServerName -force
+        if (-not $?) {
+           Write-Host "Unable to get VM ${vmName} on server ${this.ServerName}" -ForegroundColor Red
+           return $false
+        }
+        return $true
+    }
+
+    [boolean] StartVM ($vmName) {
+        Start-VM -Name $vhdFileName -ComputerName $this.ServerName
+        if (-not $?) {
+           Write-Host "Unable to start VM ${vmName} on server ${this.ServerName}" -ForegroundColor Red
+           return $false
+        }
+        return $true
+    }
 }
 
 

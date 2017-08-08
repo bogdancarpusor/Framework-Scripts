@@ -13,129 +13,250 @@ param (
     [Parameter(Mandatory=$false)] [string] $skipCopy=$false
 )
 
-$global:completed=0
-$global:elapsed=0
-$global:interval=500
-$global:boot_timeout_minutes=45
-$global:boot_timeout_intervals=$interval*($boot_timeout_minutes*60*(1000/$interval))
-$global:num_expected=0
-$global:num_remaining=0
-$global:failed=$false
-$global:booted_version="Unknown"
-$global:timer_is_running = 0
 
-class MonitoredMachine {
-    [string] $name="unknown"
-    [string] $status="Unitialized"
-}
+$scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Definition
+. "$scriptPath\backend.ps1"
 
-$timer=New-Object System.Timers.Timer
+class HypervVM {
+    [String] $name
+    [String] $status = 'Uknown'
+    [String] $memSize = '1GB'
+    [String] $generation = '1'
+    [String] $switchName = 'External'
+    [String] $vhdPath
+    [String] $testState = "Uknown"
+    [Backend] $backend
 
-[System.Collections.ArrayList]$global:monitoredMachines = @()
+    HypervVM ($name, $vhdPath) {
+        $this.name = $name
+        $this.vhdPath = $vhdPath
+        $backendFactory = [BackendFactory]::new()
+        $this.backend = $backendFactory.GetBackend("HypervBackend", @(1))
+    }
 
-$action={
-    function checkMachine ([MonitoredMachine]$machine) {
+    [boolean] start() {
+        Write-Host "Virtual Maching ${this.name} is starting" -ForegroundColor green
+        return $this.backend.StartVM($this.name)
+    }
 
-        $machineName=$machine.name
-        $machineStatus=$machine.status
+    [boolean] exists() {
+        return $this.backend.GetVM($this.name)
+    }
 
-        Write-Host "      Checking boot results for machine $machineName" -ForegroundColor green
+    [boolean] stop() {
+        return $this.backend.StopVM($this.name)
+    }
 
-        if ($machineStatus -ne "Booting") {
-            Write-Host "       ???? Machine was not in state Booting.  Cannot process" -ForegroundColor Red
+    [boolean] remove() {
+        return $this.backend.RemoveVM($this.name)
+    }
+
+    [boolean] create() {
+        return $this.backend.CreateVM($this.name, $this.vhdPath, $this.memSize, $this.generation, $this.switchName)
+    }
+
+    [boolean] runOnce() {
+        Write-Host "      Checking boot results for machine ${this.name}" -ForegroundColor green
+        if ($this.status -ne "Booting") {
+            Write-Host "       Machine was not in state Booting.  Cannot process" -ForegroundColor Red
             return
         }
 
-        $resultsFile="c:\temp\boot_results\" + $machineName
-        $progressFile="c:\temp\progress_logs\" + $machineName
-        
-        if ((test-path $resultsFile) -eq $false) {
+        if ((test-path $this.progressLogPath) -eq $false) {
             Write-Host "      Unable to locate results file $resultsFile.  Cannot process" -ForegroundColor Red
             return
         }
 
-        $results=get-content $resultsFile
+        $results = get-content $this.progressLogPath
         $resultsSplit = $results.split(' ')
         $resultsWord=$resultsSplit[0]
         $resustsgot=$resultsSplit[1]
 
         if ($resultsSplit[0] -ne "Success") {
             $resultExpected = $resultsSplit[2]
-            Write-Host "       **** Machine $machineName rebooted, but wrong version detected.  Expected $resultExpected but got $resustsgot" -ForegroundColor red
-            $global:failed=$true
+            Write-Host "       **** Machine ${this.name} rebooted, but wrong version detected.  Expected $resultExpected but got $resustsgot" -ForegroundColor red
+            $this.testState = 'failed'
         } else {
             Write-Host "       **** Machine rebooted successfully to kernel version $resustsgot" -ForegroundColor green
-            $global:booted_version=$resustsgot
+            $this.booted_version = $resustsgot
         }
 
-        $machine.status = "Completed"
-        $global:num_remaining--
+        $this.status = "test_completed"
+    }
+}
+
+class Borg {
+    [String] $vhdSourceFolder = 'D:\azure_images\'
+    [String] $vhdDestination = "D:\working_images\"
+    [String] $bootLogPath = "c:\temp\boot_results\"
+    [String] $progressLogPath = "c:\temp\progress_logs\"
+    [Int] $max_boot_time = 2700 # 45 mins
+    [Boolean] $state = $true
+    [String] $bootedVersion = "Uknown"
+    [ArrayList] $vms = @()
+
+    Borg ($Params) {
+        $vhds = Get-ChildItem $this.vhdSourceFolder | foreach-Object { $_.Name }
+        $this.initVMs($vhds)
     }
 
-    if ($global:timer_is_running -eq 0) {
-        return
-    }
-    $global:elapsed=$global:elapsed+$global:interval
+    [void] initVMs ($vhds) {
+        foreach $vhdFile in $vhds {
+            $vhdFileName = $vhdFile.Split('.')[0]
+            $vm = [HypervVM]::new($vhdFileName, $this.vhdDestination + $vhdFile)
+            $vm.state = 'created'
+            $this.vms.Add($vm)
 
-    # write-host "Checking elapsed = $global:elapsed against interval limit of $global:boot_timeout_intervals"    
-    if ($elapsed -ge $global:boot_timeout_intervals) {
-        write-host "Timer has timed out." -ForegroundColor red
-        $global:completed=1
-    }
-
-    #
-    #  Check for Hyper-V completion
-    #
-    foreach ($localMachine in $global:monitoredMachines) {
-        [MonitoredMachine]$monitoredMachine=$localMachine
-        $monitoredMachineName=$monitoredMachine.name
-        $monitoredMachineStatus=$monitoredMachine.status
-
-        $bootFile="c:\temp\boot_results\" + $monitoredMachineName
-
-        if (($monitoredMachineStatus -eq "Booting") -and ((test-path $bootFile) -eq $true)) {
-            checkMachine $monitoredMachine
+            if ($vm.exists()) {
+                Write-Host "Stopping and cleaning any existing instances of machine ${vm.name}." -ForegroundColor green           
+                $vm.stop()
+                $vm.remove()
+            }
         }
     }
 
-    if ($global:num_remaining -eq 0) {
-        write-host "***** All machines have reported in."  -ForegroundColor magenta
-        if ($global:failed -eq $true) {
-            Write-Host "One or more machines have failed to boot.  This job has failed." -ForegroundColor Red
-        }
-        write-host "Stopping the timer" -ForegroundColor green
-        $global:completed=1
-        return
-    }
- 
-    #
-    #  Update the UI
-    #
-    if (($global:elapsed % 10000) -eq 0) {
-        Write-Host ""
-        Write-Host "Waiting for remote machines to complete all testing.  There are $global:num_remaining machines left.." -ForegroundColor green
-
-        foreach ($localMachine in $global:monitoredMachines) {
-        [MonitoredMachine]$monitoredMachine=$localMachine
+    [boolean] copyVHDs () {
+        $status = $true
+        $this.status = "copying"
+        [ArrayList] $copyJobs = @()
+        Get-ChildItem $this.vhdSourceFolder |        
+        foreach-Object {
+            $vhdFile = $_.Name
+            $vm.vhdPath = $this.vhdDestination + $vhdFile
             
-            $monitoredMachineName=$monitoredMachine.name
-            $logFile="c:\temp\progress_logs\" + $monitoredMachineName
-            $monitoredMachineStatus=$monitoredMachine.status
-
-            if ($monitoredMachineStatus -eq "Booting") {
-                if ((test-path $logFile) -eq $true) {
-                    write-host "     --- Last 3 lines of results from $logFile" -ForegroundColor magenta
-                    get-content $logFile | Select-Object -Last 3 | write-host -ForegroundColor cyan
-                    write-host "" -ForegroundColor magenta
+            $destFile= $this.vhdDestination + $vhdFile
+            Remove-Item -Path $destFile -Force > $null
+            $jobName = $vhdFileName + "_copy_job"
+            $existingJob = get-job $jobName -ErrorAction SilentlyContinue > $null
+            if ($? -eq $true) {
+                stop-job $jobName -ErrorAction SilentlyContinue > $null
+                remove-job $jobName -ErrorAction SilentlyContinue > $null
+            }
+            Start-Job -Name $jobName -ScriptBlock { robocopy /njh /ndl /nc /ns /np /nfl D:\azure_images\ D:\working_images\ $args[0] } -ArgumentList @($vhdFile) > $null
+            if ($? -eq $false) {
+                Write-Host "Error starting copy vhd job - $jobName" -ForegroundColor red
+                return $false   
+            } else {
+                $copyJobs.add($jobName)
+            }
+        }
+        
+        while($true) {
+            Write-Host "Waiting for copying to complete..." -ForegroundColor green
+            $copy_complete=$true
+            foreach $jobName in $copyJobs {
+                $job = get-job -Name $jobName -ErrorAction SilentlyContinue
+                if ($job.state -eq "Failed") {
+                    $status = $false
+                    Write-Host "Copy job $jobName exited with FAILED state!" -ForegroundColor red
+                    Receive-Job -Name $jobName
+                } elseif ($job.state -eq "Completed") {
+                    Write-Host "Copy job $jobName completed successfully." -ForegroundColor green
+                    Remove-Job $jobName -ErrorAction SilentlyContinue
                 } else {
-                    Write-Host "     --- Machine $monitoredMachineName has not checked in yet"
+                    Write-Host "Current state of job $jobName is $job.state" -ForegroundColor yellow
+                    $copy_complete = $false
                 }
+            }
+
+            if ($copy_complete -eq $false) {
+                sleep 30
+            } else {
+                break
+            }
+        }
+        return $status
+    }
+
+    [boolean] createVMs() {
+        foreach $vm in $this.vms {
+            if (-not $vm.create()) {
+                Write-Host "Unable to create Hyper-V VM.  The BORG cannot continue." -ForegroundColor Red
+                return $false
+            }
+        }
+    }
+
+    [boolean] testVMs() {
+        #
+        #  Fire them up!  When they boot, the runonce should take over and install the new kernel.
+        #
+        foreach $vm in $this.vms {
+            if (-not $vm.start()) {
+                Write-Host "Unable to start Hyper-V VM.  The BORG cannot continue." -ForegroundColor Red 
+                return $false
+            }
+        }
+        
+        write-host "Initiating temporal evaluation loop (Starting the timer)" -ForegroundColor yellow
+        
+        while ($true) {
+            foreach $vm in $this.vms {
+                if (($vm.status -eq 'booting') -and ((Test-Path $vm.bootFile) -eq $true)) {
+                    $vm.testRunOnce()
+                }
+            }
+
+            foreach $vm in $this.vms {
+                if ($vm.status -ne "test_completed") {
+                    $this.status = "test_running"
+                } elseif ($vm.status -eq "booting") {
+                    if ((test-path $vm.progressLogFile) -eq $true) {
+                        write-host "     --- Last 3 lines of results from ${vm.progressLogFile}" -ForegroundColor magenta
+                        get-content $vm.progressLogFile | Select-Object -Last 3 | write-host -ForegroundColor cyan
+                        write-host "" -ForegroundColor magenta
+                    } else {
+                        Write-Host "     --- Machine ${vm.state} has not checked in yet"
+                    }
+                }
+            }
+
+            if ($this.status -eq "test_completed") {
+                write-host "***** All machines have reported in."  -ForegroundColor magenta
+                break
+            } else {
+                $this.status = "test_completed"
+            }
+
+            if ($this.elapsed_time -ge $this.max_boot_time) {
+                write-host "Timer has timed out." -ForegroundColor red
+                break
+            } else {
+                start-sleep 10
+                $this.timer = $this.timer + 10
             }
         }
 
-        [Console]::Out.Flush() 
+        write-host "Checking results" -ForegroundColor green
+        if ($this.status -eq 'test_completed') {
+            Write-Host "All machines have come back up.  Checking results." -ForegroundColor green
+            $status = $true
+            foreach $vm in $this.vms {
+                if ($vm.testStatus -eq "failed") {
+                    $status = $false
+                }
+            }
+            if ($status) {
+                Write-Host "All machines rebooted successfully to kernel version ${this.booted_version}" -ForegroundColor green
+                write-host "             BORG has been passed successfully!" -ForegroundColor yellow
+                return $true
+            } else {
+                Write-Host "Failures were detected in reboot and/or reporting of kernel version.  See log above for details." -ForegroundColor red
+                write-host "             BORG TESTS HAVE FAILED!!" -ForegroundColor red
+                return $false
+            }
+        } else {
+            write-host "Not all machines booted in the allocated time!" -ForegroundColor red
+            Write-Host " Machines states are:" -ForegroundColor red
+            foreach $vm in $this.vms {
+                Write-Host Machine "${vm.name} is in state ${vm.status}" -ForegroundColor red
+            }
+            return $false
+        }
+
     }
 }
+
 
 Write-Host "    " -ForegroundColor green
 Write-Host "                 **********************************************" -ForegroundColor yellow
@@ -170,201 +291,24 @@ Write-Host " "
 Write-Host "*************************************************************************************************************************************"
 Write-Host "                      Stopping and cleaning any existing machines.  Any errors here may be ignored." -ForegroundColor green
 
-get-job | Stop-Job > $null
-get-job | remove-job > $null
 
-#
-#  Copy the template VHDs from the safe folder to a working one
-#
-Get-ChildItem 'D:\azure_images\*.vhd' |
-foreach-Object {
-    
-    $vhdFile=$_.Name
-    $status="Copying"
-
-    $global:num_remaining++
-
-    $vhdFileName=$vhdFile.Split('.')[0]
-    
-    $machine = new-Object MonitoredMachine
-    $machine.name = $vhdFileName
-    $machine.status = "Booting" # $status
-    $global:monitoredMachines.Add($machine)
-   
-    Write-Host "Stopping and cleaning any existing instances of machine $vhdFileName." -ForegroundColor green
-    stop-vm -Name $vhdFileName -Force -ErrorAction SilentlyContinue > $null
-    remove-vm -Name $vhdFileName -Force -ErrorAction SilentlyContinue > $null
-
-    $machine.status = "Allocating"
-    # Copy-Item $sourceFile $destFile -Force
-    $destFile="d:\working_images\" + $vhdFile
-
-    if ($skipCopy -eq $false) {
-    Remove-Item -Path $destFile -Force > $null
-    
-        Write-Host "Starting job to copy VHD $vhdFileName to working directory..." -ForegroundColor green
-        $jobName=$vhdFileName + "_copy_job"
-
-        $existingJob = get-job $jobName -ErrorAction SilentlyContinue > $null
-        if ($? -eq $true) {
-            stop-job $jobName -ErrorAction SilentlyContinue > $null
-            remove-job $jobName -ErrorAction SilentlyContinue > $null
-        }
-
-        Start-Job -Name $jobName -ScriptBlock { robocopy /njh /ndl /nc /ns /np /nfl D:\azure_images\ D:\working_images\ $args[0] } -ArgumentList @($vhdFile) > $null
-    } else {
-        Write-Host "Skipping copy per command line option"
+$borg = [Borg]::new()
+if (-not $skipCopy) {
+    if (-not $borg.copyVHDs()) {
+        Write-Host "Error while copying vhds." -ForegroundColor red
+        exit 1
     }
 }
 
-Write-Host "*************************************************************************************************************************************"
-Write-Host " "
-Write-Host "                                        Start paying attention to errors again..." -ForegroundColor green
-Write-Host " "
-
-#
-#  Wait for the background copy jobs to complete before trying to start them up
-#
-if ($skipCopy -eq $false) {
-    while ($true) {
-        Write-Host "Waiting for copying to complete..." -ForegroundColor green
-        $copy_complete=$true
-        Get-ChildItem 'D:\azure_images\*.vhd' |
-        foreach-Object {
-            $vhdFile=$_.Name
-            $vhdFileName=$vhdFile.Split('.')[0]
-
-            $jobName=$vhdFileName + "_copy_job"
-
-            $jobStatus=get-job -Name $jobName -ErrorAction SilentlyContinue
-            if ($? -eq $true) {
-                $jobState = $jobStatus.State
-            } else {
-                $jobStatus = "Completed"
-            }
-        
-            if (($jobState -ne "Completed") -and 
-                ($jobState -ne "Failed")) {
-                Write-Host "      Current state of job $jobName is $jobState" -ForegroundColor yellow
-                $copy_complete = $false
-            }
-            elseif ($jobState -eq "Failed")
-            {
-                $global:failed = $true
-                Write-Host "----> Copy job $jobName exited with FAILED state!" -ForegroundColor red
-                Receive-Job -Name $jobName
-            }
-            else
-            {
-                Write-Host "      Copy job $jobName completed successfully." -ForegroundColor green
-                remove-job $jobName -ErrorAction SilentlyContinue
-            }    
-        }
-
-        if ($copy_complete -eq $false) {
-            sleep 30
-        } else {
-            break
-        }
-    }
-
-    if ($global:failed -eq $true) {
-        write-host "Copy failed.  Cannot continue..."
-        exit 1
-    }
+if (-not $borg.createVMs()) {
+    exit 1
 }
 
 Write-Host "All machines template images have been copied.  Starting the VMs in Hyper-V" -ForegroundColor green
-
-#
-#  Fire them up!  When they boot, the runonce should take over and install the new kernel.
-#
-Get-ChildItem 'D:\working_images\*.vhd' |
-foreach-Object {   
-    $vhdFile=$_.Name
-
-    $vhdFileName=$vhdFile.Split('.')[0]
-    
-    foreach ($localMachine in $global:monitoredMachines) {
-        [MonitoredMachine]$monitoredMachine=$localMachine
-        $monitoredMachineName=$machine.name
-        if ($monitoredMachineName -eq $vhdFileName) {             
-             break
-        }
-    }
-    
-    $vhdPath="D:\working_images\"+$vhdFile   
-
-    Write-Host "BORG DRONE $vhdFileName is starting" -ForegroundColor green
-
-    new-vm -Name $vhdFileName -MemoryStartupBytes 7168mb -Generation 1 -SwitchName "External" -VHDPath $vhdPath > $null
-    $monitoredMachine.status = "Booting"
-
-    if ($? -eq $false) {
-        Write-Host "Unable to create Hyper-V VM.  The BORG cannot continue." -ForegroundColor Red
-        exit 1
-    }
-
-    Start-VM -Name $vhdFileName > $null
-    if ($? -eq $false) {
-        Write-Host "Unable to start Hyper-V VM.  The BORG cannot continue." -ForegroundColor Red
-        exit 1
-    }
-}
-
-#
-#  Wait for the machines to report back
-#                     
-write-host "                          Initiating temporal evaluation loop (Starting the timer)" -ForegroundColor yellow
-unregister-event HyperVBORGTimer -ErrorAction SilentlyContinue > $null
-Register-ObjectEvent -InputObject $timer -EventName elapsed –SourceIdentifier HyperVBORGTimer -Action $action > $null
-$global:timer_is_running = 1
-$timer.Interval = 1000
-$timer.Enabled = $true
-$timer.start()
-
-while ($global:completed -eq 0) {
-    start-sleep -s 1
-}
-
-write-host "                         Exiting Temporal Evaluation Loop (Unregistering the timer)" -ForegroundColor yellow
-$global:timer_is_running = 0
-$timer.stop()
-unregister-event HyperVBORGTimer > $null
-
-#
-#  We either had success or timed out.  Figure out which
-#
-write-host "Checking results" -ForegroundColor green
-if ($global:num_remaining -eq 0) {
-    Write-Host "All machines have come back up.  Checking results." -ForegroundColor green
-    
-    if ($global:failed -eq $true) {
-        Write-Host "Failures were detected in reboot and/or reporting of kernel version.  See log above for details." -ForegroundColor red
-        write-host "             BORG TESTS HAVE FAILED!!" -ForegroundColor red
-    } else {
-        Write-Host "All machines rebooted successfully to kernel version $global:booted_version" -ForegroundColor green
-        write-host "             BORG has been passed successfully!" -ForegroundColor yellow
-    }
-} else {
-        $global:failed = $true
-        write-host "Not all machines booted in the allocated time!" -ForegroundColor red
-        Write-Host " Machines states are:" -ForegroundColor red
-        foreach ($localMachine in $global:monitoredMachines) {
-            [MonitoredMachine]$monitoredMachine=$localMachine
-            $monitoredMachineName=$monitoredMachine.name
-            $monitoredMachineState=$monitoredMachine.status
-            Write-Host Machine "$monitoredMachineName is in state $monitoredMachineState" -ForegroundColor red
-        }
-    }
-
-#
-#  Thanks for playing!
-#
-if ($global:failed -eq $false) {    
-    Write-Host "     BORG is   Exiting with success.  Thanks for Playing" -ForegroundColor green
-    exit 0
-} else {
-    Write-Host "     BORG is Exiting with failure.  Thanks for Playing" -ForegroundColor red
+if (-not $borg.testVMs()) {
+    Write-Host "BORG is Exiting with failure." -ForegroundColor red    
     exit 1
+} else {
+    Write-Host "     BORG is Exiting with success." -ForegroundColor green    
+    exit 0
 }
